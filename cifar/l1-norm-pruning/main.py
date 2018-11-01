@@ -1,15 +1,12 @@
 from __future__ import print_function
 import argparse
-import numpy as np
 import os
 import shutil
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
-from torch.autograd import Variable
 
 import models
 
@@ -120,7 +117,6 @@ def train(epoch):
     for batch_idx, (data, target) in enumerate(train_loader):
         if args.cuda:
             data, target = data.cuda(), target.cuda()
-        data, target = Variable(data), Variable(target)
         optimizer.zero_grad()
         output = model(data)
         loss = F.cross_entropy(output, target)
@@ -141,7 +137,6 @@ def test():
     for data, target in test_loader:
         if args.cuda:
             data, target = data.cuda(), target.cuda()
-        data, target = Variable(data, volatile=True), Variable(target)
         output = model(data)
         test_loss += F.cross_entropy(output, target, size_average=False).data[0] # sum up batch loss
         pred = output.data.max(1, keepdim=True)[1] # get the index of the max log-probability
@@ -164,7 +159,8 @@ for epoch in range(args.start_epoch, args.epochs):
         for param_group in optimizer.param_groups:
             param_group['lr'] *= 0.1
     train(epoch)
-    prec1 = test()
+    with torch.no_grad():
+        prec1 = test()
     is_best = prec1 > best_prec1
     best_prec1 = max(prec1, best_prec1)
     save_checkpoint({
