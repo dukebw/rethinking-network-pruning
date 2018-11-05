@@ -4,10 +4,9 @@ import os
 
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
 from torchvision import datasets, transforms
 
-from models import *
+from models import resnet
 
 
 # Prune settings
@@ -73,7 +72,6 @@ def test(model):
     for data, target in test_loader:
         if args.cuda:
             data, target = data.cuda(), target.cuda()
-        data, target = Variable(data, volatile=True), Variable(target)
         output = model(data)
         pred = output.data.max(1, keepdim=True)[1] # get the index of the max log-probability
         correct += pred.eq(target.data.view_as(pred)).cpu().sum()
@@ -82,7 +80,8 @@ def test(model):
         correct, len(test_loader.dataset), 100. * correct / len(test_loader.dataset)))
     return correct / float(len(test_loader.dataset))
 
-acc = test(model)
+with torch.no_grad():
+    acc = test(model)
 
 skip = {
     'A': [16, 20, 38, 54],
