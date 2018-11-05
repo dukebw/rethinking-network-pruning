@@ -136,9 +136,7 @@ for [m0, m1] in zip(model.modules(), newmodel.modules()):
     if isinstance(m0, nn.Conv2d):
         if conv_count == 1:
             m1.weight.data = m0.weight.data.clone()
-            conv_count += 1
-            continue
-        if conv_count % 2 == 0:
+        elif conv_count % 2 == 0:
             mask = cfg_mask[layer_id_in_cfg]
             idx = np.squeeze(np.argwhere(np.asarray(mask.cpu().numpy())))
             if idx.size == 1:
@@ -146,17 +144,14 @@ for [m0, m1] in zip(model.modules(), newmodel.modules()):
             w = m0.weight.data[idx.tolist(), :, :, :].clone()
             m1.weight.data = w.clone()
             layer_id_in_cfg += 1
-            conv_count += 1
-            continue
-        if conv_count % 2 == 1:
+        else:
             mask = cfg_mask[layer_id_in_cfg-1]
             idx = np.squeeze(np.argwhere(np.asarray(mask.cpu().numpy())))
             if idx.size == 1:
                 idx = np.resize(idx, (1,))
             w = m0.weight.data[:, idx.tolist(), :, :].clone()
             m1.weight.data = w.clone()
-            conv_count += 1
-            continue
+        conv_count += 1
     elif isinstance(m0, nn.BatchNorm2d):
         if conv_count % 2 == 1:
             mask = cfg_mask[layer_id_in_cfg-1]
@@ -179,11 +174,12 @@ for [m0, m1] in zip(model.modules(), newmodel.modules()):
 torch.save({'cfg': cfg, 'state_dict': newmodel.state_dict()}, os.path.join(args.save, 'pruned.pth.tar'))
 
 num_parameters = sum([param.nelement() for param in newmodel.parameters()])
+old_num_params = sum([p.nelement() for p in model.parameters()])
 print(newmodel)
 model = newmodel
 acc = test(model)
 
-print("number of parameters: "+str(num_parameters))
+print(f'number of parameters: {str(num_parameters)} down from {old_num_params}')
 with open(os.path.join(args.save, "prune.txt"), "w") as fp:
     fp.write("Number of parameters: \n"+str(num_parameters)+"\n")
     fp.write("Test accuracy: \n"+str(acc)+"\n")
