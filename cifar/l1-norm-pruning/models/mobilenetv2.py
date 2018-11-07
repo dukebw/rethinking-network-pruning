@@ -39,16 +39,17 @@ class Block(nn.Module):
 
 class MobileNetV2(nn.Module):
     # (expansion, out_planes, num_blocks, stride)
-    cfg = [(1,  16, 1, 1),
-           (6,  24, 2, 1),  # NOTE: change stride 2 -> 1 for CIFAR10
-           (6,  32, 3, 2),
-           (6,  64, 4, 2),
-           (6,  96, 3, 1),
+    cfg = [(1, 16, 1, 1),
+           (6, 24, 2, 1),  # NOTE: change stride 2 -> 1 for CIFAR10
+           (6, 32, 3, 2),
+           (6, 64, 4, 2),
+           (6, 96, 3, 1),
            (6, 160, 3, 2),
            (6, 320, 1, 1)]
 
-    def __init__(self, num_classes=10):
+    def __init__(self, dataset, depth, cfg=None):
         super(MobileNetV2, self).__init__()
+        num_classes = 10
         # NOTE: change conv1 stride 2 -> 1 for CIFAR10
         self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(32)
@@ -77,10 +78,6 @@ class MobileNetV2(nn.Module):
         return out
 
 
-def test():
-    net = MobileNetV2()
-    x = torch.randn(2,3,32,32)
-    y = net(x)
-    print(y.size())
-
-# test()
+def mobilenetv2(**kwargs):
+    """Constructs a MobileNetV2 model."""
+    return MobileNetV2(**kwargs)

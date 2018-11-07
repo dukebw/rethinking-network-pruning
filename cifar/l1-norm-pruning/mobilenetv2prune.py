@@ -1,0 +1,208 @@
+import argparse
+import numpy as np
+import os
+
+import torch
+import torch.nn as nn
+from torchvision import datasets, transforms
+
+from models import mobilenetv2
+
+
+# Prune settings
+parser = argparse.ArgumentParser(description='PyTorch Slimming CIFAR prune')
+parser.add_argument('--dataset', type=str, default='cifar10',
+                    help='training dataset (default: cifar10)')
+parser.add_argument('--test-batch-size', type=int, default=256, metavar='N',
+                    help='input batch size for testing (default: 256)')
+parser.add_argument('--no-cuda', action='store_true', default=False,
+                    help='disables CUDA training')
+parser.add_argument('--depth', type=int, default=56,
+                    help='depth of the mobilenetv2')
+parser.add_argument('--model', default='', type=str, metavar='PATH',
+                    help='path to the model (default: none)')
+parser.add_argument('--save', default='', type=str, metavar='PATH',
+                    help='path to save pruned model (default: none)')
+parser.add_argument('-v', default='A', type=str, 
+                    help='version of the model')
+
+args = parser.parse_args()
+args.cuda = not args.no_cuda and torch.cuda.is_available()
+
+if not os.path.exists(args.save):
+    os.makedirs(args.save)
+
+model = mobilenetv2(dataset=args.dataset, depth=args.depth)
+
+if args.cuda:
+    model.cuda()
+if args.model:
+    if os.path.isfile(args.model):
+        print("=> loading checkpoint '{}'".format(args.model))
+        checkpoint = torch.load(args.model)
+        args.start_epoch = checkpoint['epoch']
+        best_prec1 = checkpoint['best_prec1']
+        model.load_state_dict(checkpoint['state_dict'])
+        print("=> loaded checkpoint '{}' (epoch {}) Prec1: {:f}"
+              .format(args.model, checkpoint['epoch'], best_prec1))
+    else:
+        print("=> no checkpoint found at '{}'".format(args.resume))
+
+print('Pre-processing Successful!')
+
+# simple test model after Pre-processing prune (simple set BN scales to zeros)
+def test(model):
+    kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
+    if args.dataset == 'cifar10':
+        test_loader = torch.utils.data.DataLoader(
+            datasets.CIFAR10('./data.cifar10', train=False, transform=transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])),
+            batch_size=args.test_batch_size, shuffle=False, **kwargs)
+    elif args.dataset == 'cifar100':
+        test_loader = torch.utils.data.DataLoader(
+            datasets.CIFAR100('./data.cifar100', train=False, transform=transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])),
+            batch_size=args.test_batch_size, shuffle=False, **kwargs)
+    else:
+        raise ValueError("No valid dataset is given.")
+    model.eval()
+    correct = 0
+    for data, target in test_loader:
+        if args.cuda:
+            data, target = data.cuda(), target.cuda()
+        output = model(data)
+        pred = output.data.max(1, keepdim=True)[1] # get the index of the max log-probability
+        correct += pred.eq(target.data.view_as(pred)).cpu().sum()
+
+    print('\nTest set: Accuracy: {}/{} ({:.1f}%)\n'.format(
+        correct, len(test_loader.dataset), 100. * correct / len(test_loader.dataset)))
+    return correct / float(len(test_loader.dataset))
+
+with torch.no_grad():
+    acc = test(model)
+
+skip = {
+    'A': [],
+    'B': []
+}
+
+prune_prob = {
+    'A': [0.1, 0.1, 0.1],
+    'B': [0.3, 0.6, 0.8],
+}
+
+# NOTE(brendan): Convs per block (6 blocks):
+layer_id = 2
+prune_layers = []
+blocks = [m for m in model.modules() if 'Block' in str(m.__class__)]
+for blk in blocks:
+    blk_conv_i = 0
+    for m in blk.modules():
+        if isinstance(m, nn.Conv2d):
+            if blk_conv_i == 0:
+                prune_layers.append(layer_id)
+                blk_conv_i += 1
+            layer_id += 1
+# NOTE(brendan): Because there are all the conv layers in blocks, plus 2.
+total_convs = len([m for m in model.modules() if isinstance(m, nn.Conv2d)])
+assert layer_id == total_convs
+
+layer_id = 1
+cfg = []
+cfg_mask = []
+for m in model.modules():
+    if isinstance(m, nn.Conv2d):
+        out_channels = m.weight.data.shape[0]
+        if layer_id in skip[args.v]:
+            cfg_mask.append(torch.ones(out_channels))
+            cfg.append(out_channels)
+        elif layer_id in prune_layers:
+            if layer_id <= 18:
+                stage = 0
+            elif layer_id <= 36:
+                stage = 1
+            else:
+                stage = 2
+            prune_prob_stage = prune_prob[args.v][stage]
+            weight_copy = m.weight.data.abs().clone().cpu().numpy()
+            L1_norm = np.sum(weight_copy, axis=(1, 2, 3))
+            num_keep = int(out_channels * (1 - prune_prob_stage))
+            arg_max = np.argsort(L1_norm)
+            arg_max_rev = arg_max[::-1][:num_keep]
+            mask = torch.zeros(out_channels)
+            mask[arg_max_rev.tolist()] = 1
+            cfg_mask.append(mask)
+            cfg.append(num_keep)
+        layer_id += 1
+
+newmodel = mobilenetv2(dataset=args.dataset, depth=args.depth, cfg=cfg)
+if args.cuda:
+    newmodel.cuda()
+
+start_mask = torch.ones(3)
+layer_id_in_cfg = 0
+conv_count = 1
+for [m0, m1] in zip(model.modules(), newmodel.modules()):
+    if isinstance(m0, nn.Conv2d):
+        if conv_count == 1:
+            m1.weight.data = m0.weight.data.clone()
+        elif conv_count in prune_layers:
+            assert conv_count == prune_layers[layer_id_in_cfg]
+            mask = cfg_mask[layer_id_in_cfg]
+            idx = np.squeeze(np.argwhere(np.asarray(mask.cpu().numpy())))
+            if idx.size == 1:
+                idx = np.resize(idx, (1,))
+            w = m0.weight.data[idx.tolist(), :, :, :].clone()
+            m1.weight.data = w.clone()
+            layer_id_in_cfg += 1
+        elif (conv_count == (prune_layers[layer_id_in_cfg - 1] + 1)) or (conv_count == (prune_layers[layer_id_in_cfg - 1] + 2)):
+            mask = cfg_mask[layer_id_in_cfg - 1]
+            idx = np.squeeze(np.argwhere(np.asarray(mask.cpu().numpy())))
+            if idx.size == 1:
+                idx = np.resize(idx, (1,))
+            if conv_count == (prune_layers[layer_id_in_cfg - 1] + 1):
+                assert m0.weight.data.shape[1] == 1
+                w = m0.weight.data[idx.tolist(), :, :, :].clone()
+                m1.groups = len(idx)
+            else:
+                w = m0.weight.data[:, idx.tolist(), :, :].clone()
+            m1.weight.data = w.clone()
+        else:
+            assert (conv_count == total_convs) or (conv_count == (prune_layers[layer_id_in_cfg - 1] + 3))
+            m1.weight.data = m0.weight.data.clone()
+        conv_count += 1
+    elif isinstance(m0, nn.BatchNorm2d):
+        prev_conv = (conv_count - 1)
+        prev_conv_layer_id_cfg = layer_id_in_cfg - 1
+        if (prev_conv > 1) and (prev_conv == prune_layers[prev_conv_layer_id_cfg]) or (prev_conv == (prune_layers[prev_conv_layer_id_cfg] + 1)):
+            mask = cfg_mask[prev_conv_layer_id_cfg]
+            idx = np.squeeze(np.argwhere(np.asarray(mask.cpu().numpy())))
+            if idx.size == 1:
+                idx = np.resize(idx, (1,))
+            m1.weight.data = m0.weight.data[idx.tolist()].clone()
+            m1.bias.data = m0.bias.data[idx.tolist()].clone()
+            m1.running_mean = m0.running_mean[idx.tolist()].clone()
+            m1.running_var = m0.running_var[idx.tolist()].clone()
+            continue
+        assert (prev_conv == 1) or (prev_conv == total_convs) or (prev_conv == (prune_layers[prev_conv_layer_id_cfg] + 2)) or (prev_conv == (prune_layers[prev_conv_layer_id_cfg] + 3))
+        m1.weight.data = m0.weight.data.clone()
+        m1.bias.data = m0.bias.data.clone()
+        m1.running_mean = m0.running_mean.clone()
+        m1.running_var = m0.running_var.clone()
+    elif isinstance(m0, nn.Linear):
+        m1.weight.data = m0.weight.data.clone()
+        m1.bias.data = m0.bias.data.clone()
+
+torch.save({'cfg': cfg, 'state_dict': newmodel.state_dict()}, os.path.join(args.save, 'pruned.pth.tar'))
+
+num_parameters = sum([param.nelement() for param in newmodel.parameters()])
+old_num_params = sum([p.nelement() for p in model.parameters()])
+print(newmodel)
+acc = test(newmodel)
+
+print(f'number of parameters: {str(num_parameters)} down from {old_num_params}')
+with open(os.path.join(args.save, "prune.txt"), "w") as fp:
+    fp.write("Number of parameters: \n"+str(num_parameters)+"\n")
+    fp.write("Test accuracy: \n"+str(acc)+"\n")
